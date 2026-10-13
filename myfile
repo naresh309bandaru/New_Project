@@ -1,0 +1,474 @@
+pipeline {
+
+    agent {
+        label 'macos'
+    }
+
+    parameters {
+
+        choice(
+            name: 'PLATFORM',
+            choices: ['Android', 'iOS', 'Both'],
+            description: 'Select Android, iOS or Both'
+        )
+
+        string(
+            name: 'RELEASE_ID',
+            defaultValue: '',
+            description: 'Release ID, for example ios-3.31'
+        )
+
+        string(
+            name: 'TICKET_NUMBER',
+            defaultValue: '',
+            description: 'Ticket / DGP number'
+        )
+
+        string(
+            name: 'S3_BUCKET',
+            defaultValue: '',
+            description: 'S3 bucket where bundles must be uploaded'
+        )
+
+        booleanParam(
+            name: 'RUN_TESTS',
+            defaultValue: true,
+            description: 'Run application tests before release'
+        )
+    }
+
+    environment {
+        AWS_DEFAULT_REGION = 'ap-south-1'
+
+        RELEASE_DIR = ".release/${params.RELEASE_ID}"
+
+        S3_UPLOAD_DIR = ".release/${params.RELEASE_ID}/s3-upload"
+    }
+
+    stages {
+
+        /*
+         * 1. Validate Jenkins inputs
+         */
+        stage('Validate Inputs') {
+
+            steps {
+
+                script {
+
+                    if (!params.RELEASE_ID?.trim()) {
+                        error("RELEASE_ID is mandatory")
+                    }
+
+                    if (!params.TICKET_NUMBER?.trim()) {
+                        error("TICKET_NUMBER is mandatory")
+                    }
+
+                    if (!params.S3_BUCKET?.trim()) {
+                        error("S3_BUCKET is mandatory")
+                    }
+
+                    echo """
+                    =====================================
+                    RELEASE INFORMATION
+                    =====================================
+                    Platform    : ${params.PLATFORM}
+                    Release ID  : ${params.RELEASE_ID}
+                    Ticket      : ${params.TICKET_NUMBER}
+                    S3 Bucket   : ${params.S3_BUCKET}
+                    =====================================
+                    """
+                }
+            }
+        }
+
+
+        /*
+         * 2. Checkout complete Git repository
+         */
+        stage('Checkout') {
+
+            steps {
+
+                checkout scm
+
+                sh '''
+                    echo "Git repository:"
+                    git remote -v
+
+                    echo "Current commit:"
+                    git rev-parse HEAD
+                '''
+            }
+        }
+
+
+        /*
+         * 3. Install project dependencies
+         */
+        stage('Install Dependencies') {
+
+            steps {
+
+                sh '''
+                    set -e
+
+                    echo "Installing dependencies..."
+
+                    node --version
+                    npm --version
+                    yarn --version
+
+                    yarn install --frozen-lockfile
+                '''
+            }
+        }
+
+
+        /*
+         * 4. Run tests
+         */
+        stage('Test') {
+
+            when {
+                expression {
+                    return params.RUN_TESTS
+                }
+            }
+
+            steps {
+
+                sh '''
+                    set -e
+
+                    echo "Running application tests..."
+
+                    yarn test --watchAll=false
+                '''
+            }
+        }
+
+
+        /*
+         * 5. Android build
+         */
+        stage('Android Build') {
+
+            when {
+                expression {
+                    return params.PLATFORM == 'Android' ||
+                           params.PLATFORM == 'Both'
+                }
+            }
+
+            steps {
+
+                sh '''
+                    set -e
+
+                    echo "====================================="
+                    echo "ANDROID BUILD"
+                    echo "====================================="
+
+                    cd android
+
+                    chmod +x gradlew
+
+                    ./gradlew clean
+
+                    # IMPORTANT:
+                    # Keep the exact Android build command
+                    # from the developer's Android Full Release MD
+                    # here if it is different.
+
+                    ./gradlew assembleRelease
+
+                    cd ..
+
+                    echo "Android build completed."
+
+                    find android/app/build/outputs \
+                        -type f \
+                        -name "*.apk" \
+                        -print
+                '''
+            }
+        }
+
+
+        /*
+         * 6. iOS build
+         */
+        stage('iOS Build') {
+
+            when {
+                expression {
+                    return params.PLATFORM == 'iOS' ||
+                           params.PLATFORM == 'Both'
+                }
+            }
+
+            steps {
+
+                sh '''
+                    set -e
+
+                    echo "====================================="
+                    echo "IOS BUILD"
+                    echo "====================================="
+
+                    cd ios
+
+                    pod install
+
+                    cd ..
+
+                    # IMPORTANT:
+                    # Use the exact xcodebuild/export commands
+                    # from the developer's iOS Full Release MD.
+                    #
+                    # The shared document specifically uses
+                    # IOS_FINAL_EXPORT_OPTIONS_PLIST.
+
+                    echo "iOS dependencies installed."
+
+                    echo "iOS build command should follow the"
+                    echo "developer-provided iOS release instructions."
+                '''
+            }
+        }
+
+
+        /*
+         * 7. Verify release directory
+         *
+         * Developer's instruction:
+         *
+         * .release/$RELEASE_ID/s3-upload/
+         *
+         * is uploaded to S3.
+         */
+        stage('Verify S3 Upload Directory') {
+
+            steps {
+
+                sh '''
+                    set -e
+
+                    echo "====================================="
+                    echo "VERIFY RELEASE BUNDLES"
+                    echo "====================================="
+
+                    if [ ! -d ".release/$RELEASE_ID/s3-upload" ]; then
+
+                        echo "ERROR:"
+                        echo ".release/$RELEASE_ID/s3-upload/"
+                        echo "does not exist."
+
+                        exit 1
+                    fi
+
+                    echo "S3 upload directory found."
+
+                    find ".release/$RELEASE_ID/s3-upload" \
+                        -type f \
+                        -print
+                '''
+            }
+        }
+
+
+        /*
+         * 8. Upload GS / module bundles to S3
+         */
+        stage('Upload Bundles to S3') {
+
+            steps {
+
+                withCredentials([
+                    [$class: 'AmazonWebServicesCredentialsBinding',
+                     credentialsId: 'aws-jenkins-credentials']
+                ]) {
+
+                    sh '''
+                        set -e
+
+                        echo "====================================="
+                        echo "UPLOAD BUNDLES TO S3"
+                        echo "====================================="
+
+                        aws sts get-caller-identity
+
+                        aws s3 cp \
+                          ".release/$RELEASE_ID/s3-upload/" \
+                          "$S3_BUCKET/" \
+                          --recursive
+
+                        echo "Upload completed."
+
+                        echo "Verifying S3 objects..."
+
+                        aws s3 ls \
+                          "$S3_BUCKET/" \
+                          --recursive
+                    '''
+                }
+            }
+        }
+
+
+        /*
+         * 9. Finalize iOS catalog
+         *
+         * Exact command visible in your screenshot.
+         */
+        stage('Finalize iOS Catalog') {
+
+            when {
+                expression {
+                    return params.PLATFORM == 'iOS' ||
+                           params.PLATFORM == 'Both'
+                }
+            }
+
+            steps {
+
+                sh '''
+                    set -e
+
+                    echo "====================================="
+                    echo "FINALIZE IOS CATALOG"
+                    echo "====================================="
+
+                    yarn release:catalog:finalize \
+                      --plan ".release/$RELEASE_ID/release-plan.json" \
+                      --ticket-number "$TICKET_NUMBER"
+                '''
+            }
+        }
+
+
+        /*
+         * 10. Commit and push catalog
+         *
+         * Exact commands visible in your screenshot.
+         */
+        stage('Commit and Push Catalog') {
+
+            steps {
+
+                sh '''
+                    set -e
+
+                    echo "====================================="
+                    echo "COMMIT AND PUSH CATALOG"
+                    echo "====================================="
+
+                    git status
+
+                    git add versionCatalog.json
+
+                    git commit \
+                      -F ".release/$RELEASE_ID/commit-message.txt"
+
+                    git push origin HEAD
+                '''
+            }
+        }
+
+
+        /*
+         * 11. Archive release for QA
+         *
+         * QA process from your document:
+         *
+         * 1. Archive .release/$RELEASE_ID
+         * 2. Distribute QA IPA
+         * 3. Wait for QA approval
+         * 4. Upload already-built final IPA
+         * 5. Do NOT rebuild after approval
+         */
+        stage('Archive Release for QA') {
+
+            steps {
+
+                sh '''
+                    set -e
+
+                    echo "====================================="
+                    echo "ARCHIVING RELEASE"
+                    echo "====================================="
+
+                    mkdir -p release-artifacts
+
+                    cp -R \
+                      ".release/$RELEASE_ID" \
+                      "release-artifacts/"
+
+                    echo "Release archived."
+
+                    find release-artifacts \
+                      -maxdepth 4 \
+                      -type f \
+                      -print
+                '''
+
+                archiveArtifacts(
+                    artifacts: 'release-artifacts/**/*',
+                    fingerprint: true,
+                    allowEmptyArchive: false
+                )
+            }
+        }
+
+
+        /*
+         * 12. Release summary
+         */
+        stage('Release Summary') {
+
+            steps {
+
+                echo """
+                ==========================================
+                         RELEASE COMPLETED
+                ==========================================
+
+                Platform   : ${params.PLATFORM}
+                Release ID : ${params.RELEASE_ID}
+                Ticket     : ${params.TICKET_NUMBER}
+                S3 Bucket  : ${params.S3_BUCKET}
+
+                Next Step:
+                QA validation and approval.
+
+                IMPORTANT:
+                Do NOT rebuild after QA approval.
+                Use the already-built final APK/IPA.
+
+                ==========================================
+                """
+            }
+        }
+    }
+
+
+    post {
+
+        success {
+
+            echo "SuperApp release pipeline completed successfully."
+        }
+
+        failure {
+
+            echo "SuperApp release pipeline failed."
+            echo "Check the failed stage and Jenkins console output."
+        }
+
+        always {
+
+            echo "Pipeline execution completed."
+        }
+    }
+}
